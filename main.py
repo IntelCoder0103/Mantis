@@ -15,7 +15,9 @@ from botocore.client import Config
 from timelock import Timelock
 import json
 import schedule
+from btc import create_btc_embedding
 
+from sklearn.preprocessing import StandardScaler
 
 DRAND_API = "https://api.drand.sh/v2"
 DRAND_BEACON_ID = "quicknet"
@@ -48,31 +50,31 @@ assets_symbol = {
 
 currency_config =  {
     "samples": ["15m", "7d"],
-    "multiplier": 10,
-    "n_samples": 10,
+    "multiplier": 0.5,
+    "window_size": 96, # 1 day
     "dimentions": 2,
 }
 gold_config = {
     "samples": ["15m", "15d"],
-    "multiplier": 5e-3,
-    "n_samples": 10,
+    "multiplier": 1e-1,
+    "window_size": 96 * 7, # 1 week
     "dimentions": 2,
 }
 silver_config = {
     "samples": ["15m", "15d"],
     "multiplier": 1e-1,
-    "n_samples": 10,
+    "window_size": 96 * 7, # 1 week
     "dimentions": 2,
 }
 eth_config = {
     "samples": ["15m", "1mo"],
-    "n_samples": 10,
+    "window_size": 96, # 1 day
     "dimentions": 2,
-    "multiplier": 1e-3,
+    "multiplier": 1e-1,
 }
 btc_config = {
     "samples": ["15m", "1mo"],
-    "n_samples": 100,
+    "window_size": 300,
     "dimentions": 100,
     "multiplier": 1e-5,
 }
@@ -156,44 +158,139 @@ MY_HOTKEY = "5DJnNPMgkVEQZ2URiJPaQejK4rAw1D8koLt5VTdvbbFDrTHy"
 #     all_data = sigmoid_scale(all_data, data_center, data_width)
 #     print(all_data)
     
+
+# Helper functions needed for feature calculation
+def calculate_max_drawdown(prices):
+    """Calculate maximum drawdown"""
+    peak = np.maximum.accumulate(prices)
+    drawdown = (peak - prices) / peak
+    return np.max(drawdown)
+
+def calculate_atr_series(close, high, low, window=14):
+    """Vectorized ATR for pandas Series"""
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = true_range.rolling(window=window).mean()
+    return atr
+
+def calculate_hurst_exponent(prices, max_lag=50):
+    """Calculate Hurst Exponent to measure trend strength"""
+    lags = range(2, max_lag)
+    tau = [np.std(np.subtract(prices[lag:], prices[:-lag])) for lag in lags]
+    poly = np.polyfit(np.log(lags), np.log(tau), 1)
+    return poly[0]
+
+def gen_samples_from_prices(prices, n_samples):
+    prices = prices[::-1] # Reverse the array
+    # prices = prices[1:]
+    # print(prices)
     
+    # Generate n_samples count samples in slideing window,
+    price_series = []
+    sample_len = len(prices) - (n_samples + 1) * 4
+    for i in range(n_samples):
+        sample = prices[i * 4 + sample_len:i * 4:-1]  # Reverse the sample
+        price_series.append(sample)
     
+    return price_series
+
 def training_data_for_asset(asset:str):
     # data = histories[asset]['15mins']
     # data_1h = histories[asset]['1h']
     asset_config = config[asset]
     sample_config = asset_config['samples']
-    n_samples = asset_config['n_samples']
+    window = asset_config['window_size']
     
     
     interval, period = sample_config
     data = yf.download(f'{assets_symbol[asset]}', interval=interval, period=period)
-    data = data[['Close']].reset_index()
-    data.columns = ['ds', 'y']  # Prophet requires columns 'ds' (date) and 'y' (value)
-    prices = data['y'].values
-    prices = prices[::-1] # Reverse the array
+    # data_close = data[['Close']].reset_index()
+    # data_high = data[['High']].reset_index()
+    # data_low = data[['Low']].reset_index()
+    # data_close.columns = ['ds', 'y']  # Prophet requires columns 'ds' (date) and 'y' (value)
+    # data_high.columns = ['ds', 'y']
+    # data_low.columns = ['ds', 'y']
+
+    # # print(data.tail(20))
+    # prices = data_close['y'].values
+    # prices_high = data_high['y'].values
+    # prices_low = data_low['y'].values
+
+    # price_series = gen_samples_from_prices(prices, n_samples)
+    # price_series_high = gen_samples_from_prices(prices_high, n_samples)
+    # price_series_low = gen_samples_from_prices(prices_low, n_samples)
     
-    # Generate n_samples count samples in slideing window,
-    x = []
-    sample_len = len(prices) - (n_samples + 1) * 4
-    print(sample_len)
-    for i in range(n_samples):
-        sample = prices[i * 4: i * 4 + sample_len]
-        x.append(sample)
+    df = {}
+    
+    for key, _ in data.columns:
+        print(key)
+        df[key] = data[key].to_numpy().flatten()
+    df = pd.DataFrame(df, index = data.index)
+
+    prices = df['Close']
+    returns = prices.pct_change()
+    rolling_returns = returns.rolling(window)
+
+    features_df = pd.DataFrame({
+        'total_return': (prices.rolling(window).apply(lambda x: (x[-1] - x[0]) / x[0], raw=True)),
+        'volatility': rolling_returns.std(),
+        'sharpe_ratio': rolling_returns.mean() / rolling_returns.std() * np.sqrt(252),
+        'skewness': rolling_returns.skew(),
+        'kurtosis': rolling_returns.kurt(),
+        'current_price': prices,
+        'prev_hour_price': prices.shift(5),
+        'avg_true_range': calculate_atr_series(prices, df['High'], df['Low'], window=window),
+        'max_drawdown': prices.rolling(window).apply(calculate_max_drawdown, raw=True),
+        'hurst_exponent': prices.rolling(window).apply(calculate_hurst_exponent, raw=True),
+        'volume': df['Volume'],
+    })
+    
+    features_df = features_df.dropna()
+
+    # features = []
+
+    # for i, prices in enumerate(price_series):
+    #     returns = np.diff(prices) / prices[:-1]  # Simple returns
+        
+    #     feature_set = {
+    #         'total_return': (prices[-1] - prices[0]) / prices[0],
+    #         'volatility': np.std(returns),
+    #         'max_drawdown': calculate_max_drawdown(prices),
+    #         'sharpe_ratio': np.mean(returns) / np.std(returns) * np.sqrt(252),  # Annualized
+    #         'avg_true_range': calculate_atr(prices, price_series_high[i], price_series_low[i], window=14),
+    #         'hurst_exponent': calculate_hurst_exponent(prices),
+    #         'skewness': pd.Series(returns).skew(),
+    #         'kurtosis': pd.Series(returns).kurtosis(),
+    #         'current_price': prices[-1],
+    #         'prev_hour_price': prices[-5],
+    #     }
+    #     features.append(feature_set)
+
+    # Convert to DataFrame
+    # feature_df = pd.DataFrame(features)
+
+    # Standardize the features
+    scaler = StandardScaler()
+    scaled_features = scaler.fit_transform(features_df)
     # print(x)
 
     # Step 1: Fit PCA on similar sequences (or just use it directly if you have one sample)
     pca = PCA(n_components=asset_config['dimentions'])
-    x_pca = pca.fit_transform(x)
+    x_pca = pca.fit_transform(scaled_features)
     x_pca *= asset_config['multiplier']  # Scale the PCA output by the multiplier
 
+    # print(x_pca)
     x_tanh = np.tanh(x_pca)
+    # print(x_tanh)
     # Step 2: Scale to [-1, 1]
     # scaler = MinMaxScaler(feature_range=(-1, 1))
     # x_scaled = scaler.fit_transform(x_pca)
     
     # print(x_tanh)
-    return x_tanh[0].tolist()
+    return x_tanh[-1].tolist()
 
 def encrypt_embeddings(embeddings_list):
     """Encrypt embeddings using timelock encryption as per miner guide"""
@@ -439,7 +536,13 @@ def generate_asset_embedding_dims():
     # training_data_for_btc()
     for asset in normal_assets:
         print(f"Processing {asset}...")
-        result.append(training_data_for_asset(asset))
+        if asset == "BTC":
+            # Run the embedding creation
+            embedding = create_btc_embedding(n_components=100)
+            result.append(embedding[-1].tolist())
+            # print(embedding[-1])
+        else:
+            result.append(training_data_for_asset(asset))
         
     return result
 
